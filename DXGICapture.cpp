@@ -14,22 +14,15 @@ using namespace Windows::Foundation::Numerics;
 DXGICapture::DXGICapture(HWND hwnd)
 {
 	m_item = CreateCaptureItemForWindow(hwnd);
+
+	m_d3dDevice = CreateD3DDevice();
 	
 	auto dxgiDevice = CreateD3DDevice().as<IDXGIDevice>();
 	m_device = CreateDirect3DDevice(dxgiDevice.get());
 
-	m_d3dDevice = GetDXGIInterfaceFromObject<ID3D11Device>(m_device);
 	m_d3dDevice->GetImmediateContext(m_d3dContext.put());
 
 	auto size = m_item.Size();
-
-	m_swapChain = CreateDXGISwapChain(
-		m_d3dDevice,
-		static_cast<uint32_t>(size.Width),
-		static_cast<uint32_t>(size.Height),
-		static_cast<DXGI_FORMAT>(DirectXPixelFormat::B8G8R8A8UIntNormalized),
-		2);
-
 	m_framePool = Direct3D11CaptureFramePool::Create(
 		m_device,
 		DirectXPixelFormat::B8G8R8A8UIntNormalized,
@@ -50,31 +43,38 @@ void DXGICapture::StartCapture()
 
 bool DXGICapture::Grab(BYTE* buffer)
 {
-	com_ptr<ID3D11Texture2D> backBuffer;
-	check_hresult(m_swapChain->GetBuffer(0, guid_of<ID3D11Texture2D>(), backBuffer.put_void()));
-
-	// create staging texture
 	D3D11_TEXTURE2D_DESC desc;
-	backBuffer->GetDesc(&desc);
-	auto width = desc.Width;
-	auto height = desc.Height;
+	com_ptr<ID3D11Texture2D> stagingTexture{ nullptr };
+	{
+		std::lock_guard<std::mutex> lck(m_frame_mtx);
+		if (!m_frame) return false;
+		auto texture = GetDXGIInterfaceFromObject<ID3D11Texture2D>(m_frame.Surface());
 
-	desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-	desc.Usage = D3D11_USAGE_STAGING;
-	desc.BindFlags = 0;
-	desc.MiscFlags = 0;
+		texture->GetDesc(&desc);
 
-	com_ptr<ID3D11Texture2D> stagingTexture { nullptr };
-	check_hresult(m_d3dDevice->CreateTexture2D(&desc, nullptr, stagingTexture.put()));
+		desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+		desc.Usage = D3D11_USAGE_STAGING;
+		desc.BindFlags = 0;
+		desc.MiscFlags = 0;
 
-	m_d3dContext->CopyResource(stagingTexture.get(), backBuffer.get());
-	
+		// create staging texture
+		check_hresult(m_d3dDevice->CreateTexture2D(&desc, nullptr, stagingTexture.put()));
+		m_d3dContext->CopyResource(stagingTexture.get(), texture.get());
+	}
 
 	D3D11_MAPPED_SUBRESOURCE resource;
 	check_hresult(m_d3dContext->Map(stagingTexture.get(), NULL, D3D11_MAP_READ, 0, &resource));
 
-	const size_t bufferSize = width * height * 4;
-	memcpy(buffer, resource.pData, bufferSize);
+	auto bytesStride = static_cast<size_t>(desc.Width) * 4;
+
+	auto sptr = static_cast<BYTE*>(resource.pData);
+	auto dptr = static_cast<BYTE*>(buffer);
+
+	for (auto i = 0; i < (int)desc.Height; ++i) {
+		memcpy(dptr, sptr, bytesStride);
+		sptr += resource.RowPitch;
+		dptr += bytesStride;
+	}
 
 	m_d3dContext->Unmap(stagingTexture.get(), 0);
 
@@ -91,7 +91,7 @@ void DXGICapture::Close()
 		m_framePool.Close();
 		m_session.Close();
 
-		m_swapChain = nullptr;
+		// m_swapChain = nullptr;
 		m_framePool = nullptr;
 		m_session = nullptr;
 		m_item = nullptr;
@@ -116,27 +116,13 @@ void DXGICapture::OnFrameArrived(
 			// After we do that, retire the frame and then recreate our frame pool.
 			newSize = true;
 			m_lastSize = frameContentSize;
-			m_swapChain->ResizeBuffers(
-				2,
-				static_cast<uint32_t>(m_lastSize.Width),
-				static_cast<uint32_t>(m_lastSize.Height),
-				static_cast<DXGI_FORMAT>(DirectXPixelFormat::B8G8R8A8UIntNormalized),
-				0);
 		}
 
 		{
-			auto frameSurface = GetDXGIInterfaceFromObject<ID3D11Texture2D>(frame.Surface());
-
-			com_ptr<ID3D11Texture2D> backBuffer;
-			check_hresult(m_swapChain->GetBuffer(0, guid_of<ID3D11Texture2D>(), backBuffer.put_void()));
-
-			m_d3dContext->CopyResource(backBuffer.get(), frameSurface.get());
+			std::lock_guard<std::mutex> lck(m_frame_mtx);
+			m_frame = std::move(frame);
 		}
 	}
-
-	DXGI_PRESENT_PARAMETERS presentParameters = { 0 };
-	m_swapChain->Present1(1, 0, &presentParameters);
-
 	if (newSize)
 	{
 		m_framePool.Recreate(
